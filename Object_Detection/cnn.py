@@ -6,28 +6,27 @@ from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 from PIL import Image
 
-# 1. 基本設定
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("Using device:", device)
+# 基本設定
+def get_device():
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-batch_size = 64
-num_epochs = 8
-learning_rate = 1e-3
-
-# 2. 資料前處理與載入 MNIST
-transform_no_norm = transforms.Compose([
-    transforms.ToTensor(), # [0,255] → [0,1] 並轉成 (C,H,W)
-])
+# 資料前處理與載入 MNIST
+def get_dataloader_for_norm(batch_size=64):
+    transform_no_norm = transforms.Compose([
+        transforms.ToTensor(), # [0,255] → [0,1] 並轉成 (C,H,W)
+    ])
 
 
-train_dataset = datasets.MNIST(
-    root="./data",
-    train=True,
-    download=True,
-    transform=transform_no_norm
-)
+    train_dataset = datasets.MNIST(
+        root="./data",
+        train=True,
+        download=True,
+        transform=transform_no_norm
+    )
 
-train_loader = DataLoader(train_dataset, batch_size=1000, shuffle=False)
+    train_loader = DataLoader(train_dataset, batch_size=1000, shuffle=False)
+
+    return train_loader
 
 # 標準化函式
 def compute_mean_std(loader):
@@ -52,37 +51,42 @@ def compute_mean_std(loader):
     var = channel_sum_sq / n_pixels - mean ** 2
     std = torch.sqrt(var)
 
+    print("Computed mean:", mean)
+    print("Computed std:", std)
+
     return mean, std
 
-mean, std = compute_mean_std(train_loader)
-
-print("Computed mean:", mean)
-print("Computed std:", std)
-
 # 重新進行標準化後的資料處理以及載入
-transform = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize(mean.item(), std.item())
-])
+def get_dataloaders(mean, std, batch_size):
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean.item(), std.item())
+    ])
 
-train_dataset = datasets.MNIST(
-    root="./data",
-    train=True,
-    download=True,
-    transform=transform
-)
+    train_dataset = datasets.MNIST(
+        root="./data",
+        train=True,
+        download=True,
+        transform=transform,
+        num_workers=1,      # 開啟 child process
+        pin_memory=True # 固定記憶體位置
+    )
 
-test_dataset = datasets.MNIST(
-    root="./data",
-    train=False,
-    download=True,
-    transform=transform
-)
+    test_dataset = datasets.MNIST(
+        root="./data",
+        train=False,
+        download=True,
+        transform=transform,
+        num_workers=1,      # 開啟 child process
+        pin_memory=True # 固定記憶體位置
+    )
 
-train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+     
+    return train_loader, test_loader
 
-# 3. 定義 CNN 模型
+# 定義 CNN 模型
 class SimpleCNN(nn.Module):
     def __init__(self):
         super(SimpleCNN, self).__init__()
@@ -120,13 +124,7 @@ class SimpleCNN(nn.Module):
         x = self.fc2(x)             # (batch, 10) logits
         return x
 
-model = SimpleCNN().to(device)
-
-# 4. 損失函數與優化器
-criterion = nn.CrossEntropyLoss()             # 適用於 multi-class 分類
-optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-
-# 5. 訓練 & 評估函數
+# 訓練 & 評估函數
 def train_one_epoch(model, loader, optimizer, criterion, device):
     model.train()
     running_loss = 0.0
@@ -182,24 +180,18 @@ def evaluate(model, loader, criterion, device):
     epoch_acc = correct / total
     return epoch_loss, epoch_acc
 
-# 6. 主訓練迴圈
-for epoch in range(1, num_epochs + 1):
-    train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, criterion, device)
-    test_loss, test_acc = evaluate(model, test_loader, criterion, device)
 
-    print(f"Epoch [{epoch}/{num_epochs}] "
-          f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc*100:.2f}% "
-          f"|| Test Loss: {test_loss:.4f} | Test Acc: {test_acc*100:.2f}%")
 
-# 7. 實際測試手寫圖片
-inference_transform = transforms.Compose([
-    transforms.Grayscale(num_output_channels=1),      # 轉成 1 channel 灰階
-    transforms.Resize((28, 28)),                      # 縮放到 28x28
-    transforms.ToTensor(),                            # [0,255] → [0,1]
-    transforms.Normalize(mean.item(), std.item())        # 跟訓練時一樣
-])
 
-def predict_image(model, image_path, device, invert=False):
+def predict_image(model, image_path, device, mean, std, invert=False):
+    # 實際測試手寫圖片
+    inference_transform = transforms.Compose([
+        transforms.Grayscale(num_output_channels=1),      # 轉成 1 channel 灰階
+        transforms.Resize((28, 28)),                      # 縮放到 28x28
+        transforms.ToTensor(),                            # [0,255] → [0,1]
+        transforms.Normalize(mean.item(), std.item())        # 跟訓練時一樣
+    ])
+
     model.eval()  # 推論模式（關掉 Dropout 等）
     img = Image.open(image_path)
     img = inference_transform(img)   # shape: (1, 28, 28)
@@ -217,8 +209,42 @@ def predict_image(model, image_path, device, invert=False):
 
     return pred_class, confidence
 
-root = "./data/test_number"
-paths = [f"{root}/0.jpg", f"{root}/3.jpg", f"{root}/7.jpg"]
-for p in paths:
-    pred, conf = predict_image(model, p, device, invert=True)
-    print(p, "→", pred, f"({conf*100:.2f}%)") 
+def main():
+    batch_size = 64
+    num_epochs = 8
+    learning_rate = 1e-3
+    momentum = 0.9
+    weight_decay = 5e-4
+    
+    device = get_device()
+
+    train_loader = get_dataloader_for_norm(batch_size)
+    mean, std = compute_mean_std(train_loader)
+    train_loader, test_loader =  get_dataloaders(mean, std, batch_size)
+    
+    model = SimpleCNN().to(device)
+
+    # 損失函數與優化器
+    criterion = nn.CrossEntropyLoss()             # 適用於 multi-class 分類
+    optimizer = optim.Adam(
+        model.parameters(), 
+        momentim = momentum,
+        weight_decay = weight_decay,
+        lr=learning_rate)
+    
+    for epoch in range(1, num_epochs + 1):
+        train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, criterion, device)
+        test_loss, test_acc = evaluate(model, test_loader, criterion, device)
+
+        print(f"Epoch [{epoch}/{num_epochs}] "
+            f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc*100:.2f}% "
+            f"|| Test Loss: {test_loss:.4f} | Test Acc: {test_acc*100:.2f}%")
+        
+    root = "./data/test_number"
+    paths = [f"{root}/0.jpg", f"{root}/3.jpg", f"{root}/7.jpg"]
+    for p in paths:
+        pred, conf = predict_image(model, p, device, invert=True)
+        print(p, "→", pred, f"({conf*100:.2f}%)") 
+    
+if __name__ == "__main__":
+    main()
